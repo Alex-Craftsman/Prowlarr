@@ -226,6 +226,7 @@ namespace NzbDrone.Core.Indexers.Definitions
             caps.Categories.AddCategoryMapping(1460, NewznabStandardCategory.TVHD, "|- Мультсериалы (HD Video)");
             caps.Categories.AddCategoryMapping(498, NewznabStandardCategory.TVUHD, "|- Мультсериалы (UHD Video)");
             caps.Categories.AddCategoryMapping(33, NewznabStandardCategory.TVAnime, "Аниме");
+            caps.Categories.AddCategoryMapping(1277, NewznabStandardCategory.MoviesForeign, "|- Дунхуа и Эни");
             caps.Categories.AddCategoryMapping(1106, NewznabStandardCategory.TVAnime, "|- Онгоинги (HD Video)");
             caps.Categories.AddCategoryMapping(1105, NewznabStandardCategory.TVAnime, "|- Аниме (HD Video)");
             caps.Categories.AddCategoryMapping(599, NewznabStandardCategory.TVAnime, "|- Аниме (DVD)");

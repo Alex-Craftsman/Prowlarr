@@ -1,9 +1,16 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.Http;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using NLog;
+using NzbDrone.Common.Extensions;
+using NzbDrone.Common.Http;
 using NzbDrone.Common.Instrumentation.Extensions;
+using NzbDrone.Common.Serializer;
+using NzbDrone.Core.Applications;
+using NzbDrone.Core.Applications.Radarr;
 using NzbDrone.Core.Exceptions;
 using NzbDrone.Core.Indexers;
 using NzbDrone.Core.Indexers.Events;
@@ -24,16 +31,22 @@ namespace NzbDrone.Core.IndexerSearch
         private readonly IIndexerLimitService _indexerLimitService;
         private readonly IEventAggregator _eventAggregator;
         private readonly IIndexerFactory _indexerFactory;
+        private readonly IApplicationFactory _applicationFactory;
+        private readonly IHttpClient _httpClient;
         private readonly Logger _logger;
 
         public ReleaseSearchService(IEventAggregator eventAggregator,
                                 IIndexerFactory indexerFactory,
                                 IIndexerLimitService indexerLimitService,
+                                IApplicationFactory applicationFactory,
+                                IHttpClient httpClient,
                                 Logger logger)
         {
             _eventAggregator = eventAggregator;
             _indexerFactory = indexerFactory;
             _indexerLimitService = indexerLimitService;
+            _applicationFactory = applicationFactory;
+            _httpClient = httpClient;
             _logger = logger;
         }
 
@@ -62,7 +75,19 @@ namespace NzbDrone.Core.IndexerSearch
             searchSpec.Year = request.year;
             searchSpec.Genre = request.genre;
 
-            var releases = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+            var releases = new List<ReleaseInfo>();
+
+            foreach (var spec in ExpandMovieSearchCriteria(searchSpec))
+            {
+                var specReleases = await Dispatch(indexer => indexer.Fetch(spec), spec);
+
+                if (!MovieSearchTermEquals(spec.SearchTerm, searchSpec.SearchTerm))
+                {
+                    specReleases = AddOriginalMovieSearchTermToReleases(specReleases, searchSpec.SearchTerm);
+                }
+
+                releases.AddRange(specReleases);
+            }
 
             return new NewznabResults { Releases = DeDupeReleases(releases) };
         }
@@ -125,7 +150,19 @@ namespace NzbDrone.Core.IndexerSearch
         {
             var searchSpec = Get<BasicSearchCriteria>(request, indexerIds, interactiveSearch);
 
-            var releases = await Dispatch(indexer => indexer.Fetch(searchSpec), searchSpec);
+            var releases = new List<ReleaseInfo>();
+
+            foreach (var spec in ExpandBasicMovieSearchCriteria(searchSpec))
+            {
+                var specReleases = await Dispatch(indexer => indexer.Fetch(spec), spec);
+
+                if (!MovieSearchTermEquals(spec.SearchTerm, searchSpec.SearchTerm))
+                {
+                    specReleases = AddOriginalMovieSearchTermToReleases(specReleases, searchSpec.SearchTerm);
+                }
+
+                releases.AddRange(specReleases);
+            }
 
             return new NewznabResults { Releases = DeDupeReleases(releases) };
         }
@@ -277,6 +314,367 @@ namespace NzbDrone.Core.IndexerSearch
             return releases.GroupBy(r => r.Guid)
                 .Select(r => r.OrderBy(v => v.IndexerPriority).First())
                 .ToList();
+        }
+
+        private IEnumerable<MovieSearchCriteria> ExpandMovieSearchCriteria(MovieSearchCriteria searchSpec)
+        {
+            yield return searchSpec;
+
+            if (searchSpec.Offset is > 0)
+            {
+                yield break;
+            }
+
+            var alternateTerms = GetRadarrAlternateMovieTitles(searchSpec)
+                .Where(t => t.IsNotNullOrWhiteSpace())
+                .OrderBy(GetMovieTitleSearchPriority)
+                .SelectMany(t => BuildMovieSearchTerms(t, searchSpec.Year))
+                .Distinct(StringComparer.InvariantCultureIgnoreCase)
+                .Where(t => !MovieSearchTermEquals(t, searchSpec.SearchTerm))
+                .Take(40)
+                .ToList();
+
+            foreach (var term in alternateTerms)
+            {
+                var expanded = CopyMovieSearchCriteria(searchSpec);
+                expanded.SearchTerm = term;
+                expanded.ImdbId = null;
+                expanded.TmdbId = null;
+                expanded.TraktId = null;
+                expanded.DoubanId = null;
+                expanded.Genre = null;
+
+                yield return expanded;
+            }
+        }
+
+        private IEnumerable<BasicSearchCriteria> ExpandBasicMovieSearchCriteria(BasicSearchCriteria searchSpec)
+        {
+            yield return searchSpec;
+
+            if (searchSpec.Offset is > 0 ||
+                searchSpec.SearchTerm.IsNullOrWhiteSpace() ||
+                searchSpec.Categories?.Any(c => c >= 2000 && c < 3000) != true)
+            {
+                yield break;
+            }
+
+            var movieSearchSpec = new MovieSearchCriteria
+            {
+                SearchTerm = searchSpec.SearchTerm,
+                Categories = searchSpec.Categories,
+                IndexerIds = searchSpec.IndexerIds,
+                Limit = searchSpec.Limit,
+                Offset = searchSpec.Offset,
+                MinAge = searchSpec.MinAge,
+                MaxAge = searchSpec.MaxAge,
+                MinSize = searchSpec.MinSize,
+                MaxSize = searchSpec.MaxSize,
+                Source = searchSpec.Source,
+                Host = searchSpec.Host,
+                SearchType = searchSpec.SearchType,
+                InteractiveSearch = searchSpec.InteractiveSearch
+            };
+
+            var alternateTerms = GetRadarrAlternateMovieTitles(movieSearchSpec)
+                .Where(t => t.IsNotNullOrWhiteSpace())
+                .OrderBy(GetMovieTitleSearchPriority)
+                .SelectMany(t => BuildMovieSearchTerms(t, null))
+                .Distinct(StringComparer.InvariantCultureIgnoreCase)
+                .Where(t => !MovieSearchTermEquals(t, searchSpec.SearchTerm))
+                .Take(40)
+                .ToList();
+
+            foreach (var term in alternateTerms)
+            {
+                var expanded = CopyBasicSearchCriteria(searchSpec);
+                expanded.SearchTerm = term;
+
+                yield return expanded;
+            }
+        }
+
+        private IEnumerable<string> GetRadarrAlternateMovieTitles(MovieSearchCriteria searchSpec)
+        {
+            if (!searchSpec.ImdbId.IsNotNullOrWhiteSpace() &&
+                !searchSpec.TmdbId.HasValue &&
+                !searchSpec.SearchTerm.IsNotNullOrWhiteSpace())
+            {
+                return Enumerable.Empty<string>();
+            }
+
+            var titles = new List<string>();
+
+            foreach (var app in _applicationFactory.SyncEnabled(false).Where(a => a.Definition.Implementation == nameof(Radarr)))
+            {
+                if (app.Definition.Settings is not RadarrSettings settings)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var request = BuildApplicationRequest(settings.BaseUrl, "/api/v3/movie", settings.ApiKey, settings.AuthUsername, settings.AuthPassword);
+                    var response = _httpClient.Execute(request);
+
+                    if ((int)response.StatusCode >= 300)
+                    {
+                        continue;
+                    }
+
+                    var movies = Json.Deserialize<List<RadarrMovieMetadata>>(response.Content);
+                    var movie = movies.FirstOrDefault(m => MovieMatches(m, searchSpec));
+
+                    if (movie == null)
+                    {
+                        continue;
+                    }
+
+                    titles.Add(movie.Title);
+                    titles.Add(movie.OriginalTitle);
+                    titles.AddRange(movie.AlternateTitles?.Select(t => t.Title) ?? Enumerable.Empty<string>());
+                }
+                catch (Exception ex)
+                {
+                    _logger.Debug(ex, "Unable to retrieve Radarr alternate titles from {0}", app.Definition.Name);
+                }
+            }
+
+            return titles
+                .Where(t => t.IsNotNullOrWhiteSpace())
+                .Distinct(StringComparer.InvariantCultureIgnoreCase);
+        }
+
+        private static HttpRequest BuildApplicationRequest(string baseUrl, string resource, string apiKey, string username, string password)
+        {
+            var requestBuilder = new HttpRequestBuilder(baseUrl.TrimEnd('/'))
+                .Resource(resource)
+                .Accept(HttpAccept.Json)
+                .SetHeader("X-Api-Key", apiKey);
+
+            if (username.IsNotNullOrWhiteSpace() || password.IsNotNullOrWhiteSpace())
+            {
+                requestBuilder.NetworkCredential = new BasicNetworkCredential(username, password);
+            }
+
+            var request = requestBuilder.Build();
+            request.Headers.ContentType = "application/json";
+            request.Method = HttpMethod.Get;
+            request.AllowAutoRedirect = true;
+
+            return request;
+        }
+
+        private static bool MovieMatches(RadarrMovieMetadata movie, MovieSearchCriteria searchSpec)
+        {
+            if (searchSpec.TmdbId.HasValue && movie.TmdbId == searchSpec.TmdbId.Value)
+            {
+                return true;
+            }
+
+            if (searchSpec.ImdbId.IsNotNullOrWhiteSpace() &&
+                ParseUtil.GetImdbId(movie.ImdbId)?.ToString("D7") == searchSpec.ImdbId)
+            {
+                return true;
+            }
+
+            if (searchSpec.SearchTerm.IsNotNullOrWhiteSpace())
+            {
+                var requested = NormalizeMovieSearchTerm(searchSpec.SearchTerm);
+                var titles = new List<string> { movie.Title, movie.OriginalTitle };
+                titles.AddRange(movie.AlternateTitles?.Select(t => t.Title) ?? Enumerable.Empty<string>());
+
+                return titles.Any(t => NormalizeMovieSearchTerm(t) == requested);
+            }
+
+            return false;
+        }
+
+        private static IEnumerable<string> BuildMovieSearchTerms(string title, int? year)
+        {
+            title = title.Trim();
+
+            yield return title;
+
+            if (year.HasValue && !title.Contains(year.Value.ToString()))
+            {
+                yield return $"{title} {year.Value}";
+            }
+        }
+
+        private static int GetMovieTitleSearchPriority(string title)
+        {
+            if (title.Any(c => c >= '\u0400' && c <= '\u04FF'))
+            {
+                return 0;
+            }
+
+            if (title.All(c => c <= '\u024F'))
+            {
+                return 1;
+            }
+
+            return 2;
+        }
+
+        private static bool MovieSearchTermEquals(string left, string right)
+        {
+            return NormalizeMovieSearchTerm(left) == NormalizeMovieSearchTerm(right);
+        }
+
+        private static IList<ReleaseInfo> AddOriginalMovieSearchTermToReleases(IList<ReleaseInfo> releases, string originalSearchTerm)
+        {
+            if (originalSearchTerm.IsNullOrWhiteSpace())
+            {
+                return releases;
+            }
+
+            var normalizedOriginal = NormalizeMovieSearchTerm(originalSearchTerm);
+            var originalTitlePrefix = FormatMovieSearchTermForReleaseTitle(originalSearchTerm);
+            var originalYear = GetMovieSearchTermYear(originalSearchTerm);
+
+            foreach (var release in releases)
+            {
+                if (release.Title.IsNullOrWhiteSpace())
+                {
+                    continue;
+                }
+
+                if (NormalizeMovieSearchTerm(release.Title).Contains(normalizedOriginal))
+                {
+                    continue;
+                }
+
+                if (originalYear.HasValue && HasConflictingReleaseYear(release.Title, originalYear.Value))
+                {
+                    continue;
+                }
+
+                release.Title = $"{originalTitlePrefix} {release.Title}";
+            }
+
+            return releases;
+        }
+
+        private static string FormatMovieSearchTermForReleaseTitle(string searchTerm)
+        {
+            var normalized = string.Join(" ", searchTerm.Split(' ', StringSplitOptions.RemoveEmptyEntries)).Trim();
+
+            if (TryGetTrailingMovieYear(normalized, out var year))
+            {
+                return $"{normalized.Substring(0, normalized.Length - 5).Trim()} ({year})";
+            }
+
+            return normalized;
+        }
+
+        private static string NormalizeMovieSearchTerm(string term)
+        {
+            if (term.IsNullOrWhiteSpace())
+            {
+                return string.Empty;
+            }
+
+            var normalized = string.Join(" ", term.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                .Trim()
+                .ToLowerInvariant();
+
+            if (TryGetTrailingMovieYear(normalized, out _))
+            {
+                normalized = normalized.Substring(0, normalized.Length - 5).Trim();
+            }
+
+            return normalized;
+        }
+
+        private static int? GetMovieSearchTermYear(string searchTerm)
+        {
+            var normalized = string.Join(" ", searchTerm.Split(' ', StringSplitOptions.RemoveEmptyEntries)).Trim();
+
+            if (TryGetTrailingMovieYear(normalized, out var year))
+            {
+                return year;
+            }
+
+            return null;
+        }
+
+        private static bool TryGetTrailingMovieYear(string searchTerm, out int year)
+        {
+            if (searchTerm.Length > 5 && searchTerm[^5] == ' ')
+            {
+                return int.TryParse(searchTerm.AsSpan(searchTerm.Length - 4), out year);
+            }
+
+            year = 0;
+            return false;
+        }
+
+        private static bool HasConflictingReleaseYear(string releaseTitle, int expectedYear)
+        {
+            return Regex.Matches(releaseTitle, @"(?:19|20)\d{2}")
+                .Select(m => ParseUtil.CoerceInt(m.Value))
+                .Any(year => year != expectedYear);
+        }
+
+        private static MovieSearchCriteria CopyMovieSearchCriteria(MovieSearchCriteria source)
+        {
+            return new MovieSearchCriteria
+            {
+                InteractiveSearch = source.InteractiveSearch,
+                IndexerIds = source.IndexerIds,
+                SearchTerm = source.SearchTerm,
+                Categories = source.Categories,
+                SearchType = source.SearchType,
+                Limit = source.Limit,
+                Offset = source.Offset,
+                MinAge = source.MinAge,
+                MaxAge = source.MaxAge,
+                MinSize = source.MinSize,
+                MaxSize = source.MaxSize,
+                Source = source.Source,
+                Host = source.Host,
+                ImdbId = source.ImdbId,
+                TmdbId = source.TmdbId,
+                TraktId = source.TraktId,
+                DoubanId = source.DoubanId,
+                Year = source.Year,
+                Genre = source.Genre
+            };
+        }
+
+        private static BasicSearchCriteria CopyBasicSearchCriteria(BasicSearchCriteria source)
+        {
+            return new BasicSearchCriteria
+            {
+                InteractiveSearch = source.InteractiveSearch,
+                IndexerIds = source.IndexerIds,
+                SearchTerm = source.SearchTerm,
+                Categories = source.Categories,
+                SearchType = source.SearchType,
+                Limit = source.Limit,
+                Offset = source.Offset,
+                MinAge = source.MinAge,
+                MaxAge = source.MaxAge,
+                MinSize = source.MinSize,
+                MaxSize = source.MaxSize,
+                Source = source.Source,
+                Host = source.Host
+            };
+        }
+
+        private class RadarrMovieMetadata
+        {
+            public string Title { get; set; }
+            public string OriginalTitle { get; set; }
+            public string ImdbId { get; set; }
+            public int TmdbId { get; set; }
+            public List<RadarrAlternateTitle> AlternateTitles { get; set; }
+        }
+
+        private class RadarrAlternateTitle
+        {
+            public string Title { get; set; }
         }
     }
 }
